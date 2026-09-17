@@ -130,6 +130,19 @@ set -euo pipefail
 root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cfg="$root/darnlink-gate.json"
 
+# The interpreter every JSON read below uses: `python3`, or `python` when THAT is the Python 3. A
+# Windows venv ships python.exe and no python3, so a Windows CI agent had no python3 at all: every
+# read_cfg silently fell back to its default and the gate ran darnlink v0.7.0 -- which predates
+# directory links -- at mode=check with no excludes, reporting every correct directory link as a
+# repair. Probed by RUNNING it, not with `command -v`: Windows can also have a python3 Store stub
+# that exists on PATH and does not start.
+PY=""
+for _py in python3 python; do
+  if "$_py" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+    PY="$_py"; break
+  fi
+done
+
 # A config that EXISTS but does not parse is a hard error, in both fail modes.
 #
 # Every reader below swallows a parse error into an empty dict, which is the right thing for a
@@ -148,18 +161,18 @@ cfg="$root/darnlink-gate.json"
 # ausencia del interprete y esto acusaria de config invalida a un fichero perfecto. Son dos
 # condiciones distintas -"no puedo validar" vs "esto esta roto"- y la de arriba ya la trata el
 # `bail` de mas abajo. Lo cazo un test que simula python3 ausente: convertia un exit 3 en 127.
-if [ -f "$cfg" ] && command -v python3 >/dev/null 2>&1 \
-   && ! python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8-sig"))' "$cfg" 2>/dev/null; then
+if [ -f "$cfg" ] && [ -n "$PY" ] \
+   && ! "$PY" -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8-sig"))' "$cfg" 2>/dev/null; then
   echo "darnlink-gate: $cfg exists but is not valid JSON -> FAILING." >&2
   echo "  Nothing was validated. Every key would have silently reverted to its default," >&2
   echo "  including the pinned version, mode and excludes. Parse error:" >&2
-  python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8-sig"))' "$cfg" 2>&1 \
+  "$PY" -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8-sig"))' "$cfg" 2>&1 \
     | tail -1 | sed 's/^/    /' >&2
   exit 1
 fi
 
 # --- read config (JSON, all optional) via python; env wins over file ---
-read_cfg() { python3 - "$cfg" "$1" "$2" <<'PY' 2>/dev/null || printf '%s' "$2"
+read_cfg() { "${PY:-python3}" - "$cfg" "$1" "$2" <<'PY' 2>/dev/null || printf '%s' "$2"
 import json, sys
 # ⚠️ En Windows, `print()` traduce cada \n a \r\n, y esta salida la consume el SHELL. Con UN valor
 # no se nota: `$(...)` se come el salto final junto con su \r. Con una LISTA si: el separador queda
@@ -184,7 +197,7 @@ PY
 # absent key, `[]` and `[""]` all arrive as the empty string. `[""]` is the likeliest typo of the
 # three (a template line left half-filled) and the only one that must be named out loud, so ask for
 # the length separately instead of trying to infer it from the flattened value.
-read_cfg_len() { python3 - "$cfg" "$1" <<'PY' 2>/dev/null || printf '0'
+read_cfg_len() { "${PY:-python3}" - "$cfg" "$1" <<'PY' 2>/dev/null || printf '0'
 import json, sys
 sys.stdout.reconfigure(newline="\n")   # mismo motivo que read_cfg: aqui el \r rompe la ARITMETICA
 try:
@@ -338,6 +351,14 @@ bail() {  # $1 = reason
   exit 0
 }
 
+# A config file this recipe cannot READ is not the same as no config file: every key would silently
+# revert to its default, and the default ref is an old darnlink (see PY above) -- a verdict about a
+# policy written in no file. With no interpreter and no DARNLINK_REF in the environment the pinned
+# version is unknowable here, so this is a can't-gate, not a quiet run of the wrong version.
+if [ -f "$cfg" ] && [ -z "$PY" ] && [ -z "${DARNLINK_REF:-}" ]; then
+  bail "no python3 or python (3.x) to read $cfg, so its pinned ref, mode and excludes are unknown (the default ref would be $REF)"
+fi
+
 # --- build darnlink args (excludes + ignore-blocks) ---
 DL_ARGS=()
 for e in "${EXCLUDES[@]}";      do [ -n "$e" ] && DL_ARGS+=(--exclude "$e"); done
@@ -369,7 +390,7 @@ if ! run --help >/dev/null 2>&1; then bail "can't run darnlink at $REF (bad ref 
 # single token ERR if it could not be evaluated — same contract as create_readme_offenders, so the
 # caller can apply the never-turn-a-red-gate-green rule.
 dangling_findings() {
-  command -v python3 >/dev/null 2>&1 || { echo ERR; return 0; }
+  [ -n "$PY" ] || { echo ERR; return 0; }
   local json jrc tmp
   set +e
   json="$(run check . --json "${DL_ARGS[@]}" 2>/dev/null)"; jrc=$?
@@ -382,7 +403,7 @@ dangling_findings() {
   # commit leaks once per commit).
   local out prc
   set +e
-  out="$(python3 - "$tmp" <<'PY'
+  out="$("$PY" - "$tmp" <<'PY'
 import json, sys
 sys.stdout.reconfigure(newline="\n")  # Windows: print() would emit \r\n and the CR travels glued to every value
 try:
@@ -401,7 +422,7 @@ PY
 }
 
 create_readme_offenders() {
-  command -v python3 >/dev/null 2>&1 || { echo ERR; return 0; }
+  [ -n "$PY" ] || { echo ERR; return 0; }
   local cr_args=("${DL_ARGS[@]}") e
   for e in "${CREATE_README_EXCLUDES[@]}"; do [ -n "$e" ] && cr_args+=(--exclude "$e"); done
   local json jrc tmp
@@ -424,7 +445,7 @@ create_readme_offenders() {
   # (stderr is NOT captured — the per-offender lines are meant to reach the user as they are printed.)
   local out prc
   set +e
-  out="$(python3 - "$tmp" <<'PY'
+  out="$("$PY" - "$tmp" <<'PY'
 import json, sys
 sys.stdout.reconfigure(newline="\n")  # Windows: print() would emit \r\n and the CR travels glued to every value
 try:
@@ -670,8 +691,8 @@ fi
 #      whole-tree reasoning, and per the wall architecture the staged pre-commit stays fast — max is
 #      enforced at the whole-repo wall (pre-push / CI). See docs/elevating-your-link-gate.md §7.
 # python3 does the filtering — fail OPEN if it's missing (don't brick a commit; CI covers the wall).
-if ! command -v python3 >/dev/null 2>&1; then
-  bail "(staged) python3 not found"
+if [ -z "$PY" ]; then
+  bail "(staged) no python3 or python (3.x) found"
 fi
 mapfile -t STAGED < <(git diff --cached --name-only --diff-filter=ACMR -- '*.md' 2>/dev/null || true)
 [ "${#STAGED[@]}" -eq 0 ] && { echo "darnlink-gate (staged): no staged .md — nothing to judge."; exit 0; }
@@ -719,7 +740,7 @@ fi
 
 # Paths via env, PAYLOADS via files (see the MAX_ARG_STRLEN note above). No interpolation into the
 # script either way → no injection from finding text.
-python3 <<'PY'
+"$PY" <<'PY'
 import json, os, sys
 sys.stdout.reconfigure(newline="\n")  # Windows: print() would emit \r\n and the CR travels glued to every value
 root = os.environ["DL_ROOT"]

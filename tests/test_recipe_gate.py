@@ -314,6 +314,9 @@ def test_unavailable_create_readme_axis_does_not_mask_a_failing_core(tmp_path):
     env["PATH"] = str(bindir)  # only the minimal bin → python3 is unreachable
     env["DARNLINK_BIN"] = dbin
     env["DARNLINK_GATE_MODE"] = "check"
+    # With a darnlink-gate.json present and no interpreter to read it, the recipe refuses to guess the
+    # pinned ref (it would silently be the old default); CI declares it through the env instead.
+    env["DARNLINK_REF"] = "git+https://example.invalid/darnlink@unused-the-shim-ignores-it"
     env["DARNLINK_GATE_CREATE_README"] = "1"  # request the axis via env (no python3 to read the json)
     # sanity: python3 really is unreachable through this PATH
     assert subprocess.run([needed["bash"], "-c", "command -v python3"], env=env,
@@ -334,6 +337,87 @@ def test_unavailable_create_readme_axis_does_not_mask_a_failing_core(tmp_path):
         f"core strict failure must survive an unavailable create-readme axis; got {r.returncode}\n"
         f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
     )
+
+
+# --- the config must be READ, or the gate must say it could not ----------------------------------
+#
+# Found on a Windows CI agent: a venv there ships `python.exe` and no `python3`, so every read_cfg fell
+# back to its default in silence and the gate ran darnlink v0.7.0 -- which predates directory links --
+# reporting every correct directory link in the tree as a repair. Linux, same tree, same pin: clean.
+
+_PINNED = "git+https://example.invalid/darnlink@pinned-by-the-config"
+
+
+def _minimal_path(tmp_path: Path, with_python: bool) -> tuple[Path, dict]:
+    """A PATH with the recipe's tools, NO python3, and (optionally) a `python` that is a Python 3.
+    Its `uvx` records the --from ref it is asked for, then runs the injected darnlink."""
+    needed = {}
+    for tool in ("bash", "git", "mktemp", "rm", "tr", "env"):
+        found = shutil.which(tool)
+        if found is None:
+            pytest.skip(f"need {tool} for this test")
+        needed[tool] = found
+    for tool in ("realpath", "dirname"):          # best effort, see the test above
+        found = shutil.which(tool)
+        if found is not None:
+            needed[tool] = found
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for tool, found in needed.items():
+        os.symlink(found, bindir / tool)
+    if with_python:
+        os.symlink(sys.executable, bindir / "python")
+    shim = bindir / "uvx"
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        '[ "${1:-}" = "--from" ] && printf \'%s\\n\' "$2" >> "$REF_LOG"\n'
+        'args=("$@")\n'
+        '[ "${args[0]:-}" = "--from" ] && args=("${args[@]:2}")\n'
+        '[ "${args[0]:-}" = "darnlink" ] && args=("${args[@]:1}")\n'
+        'exec "${DARNLINK_BIN:-darnlink}" "${args[@]}"\n'
+    )
+    shim.chmod(0o755)
+    return bindir, needed
+
+
+def _repo_with_pinned_config(tmp_path: Path, git: str) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run([git, "init", "-q"], cwd=repo, env=_clean_env(), check=True)
+    (repo / "T.md").write_text(f"---\nuuid: {U}\n---\n# T\n")
+    (repo / "darnlink-gate.json").write_text(json.dumps({"ref": _PINNED, "mode": "check"}))
+    return repo
+
+
+def test_without_python3_the_recipe_reads_its_config_through_python(tmp_path):
+    bindir, needed = _minimal_path(tmp_path, with_python=True)
+    repo = _repo_with_pinned_config(tmp_path, needed["git"])
+    env = _clean_env()
+    env["PATH"] = str(bindir)
+    env["DARNLINK_BIN"] = _darnlink_bin()
+    env["REF_LOG"] = str(tmp_path / "refs.log")
+    assert subprocess.run([needed["bash"], "-c", "command -v python3"], env=env,
+                          capture_output=True).returncode != 0, "python3 must be unreachable here"
+    r = subprocess.run([needed["bash"], str(RECIPE)], cwd=repo, env=env, capture_output=True, text=True)
+    asked = (tmp_path / "refs.log").read_text().split() if (tmp_path / "refs.log").exists() else []
+    assert asked and set(asked) == {_PINNED}, (
+        f"the recipe must run the ref pinned in darnlink-gate.json, read through `python`; it asked "
+        f"uvx for {asked}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}")
+
+
+@pytest.mark.parametrize("fail_closed, expected_rc", [("", 0), ("1", 4)])
+def test_without_any_python_a_config_file_is_a_cant_gate_not_the_default_ref(tmp_path, fail_closed, expected_rc):
+    bindir, needed = _minimal_path(tmp_path, with_python=False)
+    repo = _repo_with_pinned_config(tmp_path, needed["git"])
+    env = _clean_env()
+    env["PATH"] = str(bindir)
+    env["DARNLINK_BIN"] = _darnlink_bin()
+    env["REF_LOG"] = str(tmp_path / "refs.log")
+    env["DARNLINK_GATE_FAIL_CLOSED"] = fail_closed
+    r = subprocess.run([needed["bash"], str(RECIPE)], cwd=repo, env=env, capture_output=True, text=True)
+    assert r.returncode == expected_rc and "no python3 or python" in r.stderr, (
+        f"rc={r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}")
+    assert not (tmp_path / "refs.log").exists(), "darnlink must not run with a ref nobody pinned"
 
 
 # --- (c) the dangling axis (015) and its added-lines ratchet ----------------------------------------
