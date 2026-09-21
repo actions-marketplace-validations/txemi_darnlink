@@ -60,6 +60,12 @@ pipeline {
                     set -eu
                     # A PR checkout only brings the PR ref: fetch the base explicitly.
                     git fetch --quiet origin "+refs/heads/${CHANGE_TARGET}:refs/remotes/origin/${CHANGE_TARGET}"
+                    # A base equal to this commit means an empty range: every gate below would pass
+                    # without reading anything.
+                    if [ "$(git rev-parse "origin/${CHANGE_TARGET}")" = "$(git rev-parse HEAD)" ]; then
+                      echo "the pull request base is this very commit: nothing to judge. Failing closed." >&2
+                      exit 1
+                    fi
                     # The API address is derived from CHANGE_URL; the token stays in the environment.
                     { set +x; } 2>/dev/null
                     PR_TEXT_FILE="${WORKSPACE_TMP}/pr.txt" python3 tools/pr_text.py
@@ -99,8 +105,21 @@ pipeline {
                     printf 'header = "Authorization: token %s"\\n' "${API_TOKEN}" | curl -fsSL --config - \
                       "${SECRET_SCAN_URL}" -o "${WORKSPACE_TMP}/secret-scan"
                     set -x
-                    # Only what the branch adds is judged; on a branch build, the last commit.
-                    if [ -n "${CHANGE_TARGET:-}" ]; then base="origin/${CHANGE_TARGET}"; else base="HEAD~1"; fi
+                    # Only what the branch adds is judged. A base that IS this commit gives an empty
+                    # diff, which reads as clean without looking, so such a base is discarded; and the
+                    # previous SUCCESSFUL build is used, never the previous build: a red build must
+                    # not use up the finding. No usable base: fail closed.
+                    head="$(git rev-parse HEAD)"
+                    base=""
+                    for candidate in ${CHANGE_TARGET:+"origin/${CHANGE_TARGET}"} "${GIT_PREVIOUS_SUCCESSFUL_COMMIT:-}" "HEAD~1"; do
+                      [ -n "$candidate" ] || continue
+                      sha="$(git rev-parse --verify --quiet "${candidate}^{commit}")" || continue
+                      [ "$sha" != "$head" ] || continue
+                      git merge-base --is-ancestor "$sha" "$head" || [ -n "${CHANGE_TARGET:-}" ] || continue
+                      base="$sha"
+                      break
+                    done
+                    [ -n "$base" ] || { echo "secret-scan: no base other than this very commit. Failing closed." >&2; exit 1; }
                     python3 "${WORKSPACE_TMP}/secret-scan" --against "$base"
                   '''
                 }
