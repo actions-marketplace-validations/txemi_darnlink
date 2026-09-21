@@ -86,11 +86,126 @@ _DISALLOWED_URL_CHARS_RE = re.compile(r"[\x00-\x20\x7f]")
 
 
 @dataclass(frozen=True)
+class ForgejoServer:
+    """One self-hosted Forgejo instance a consuming repo DECLARED, under every name it answers to.
+
+    A single server routinely has several names, and which of them resolves depends on where the
+    run happens: a name on a private overlay network works on a laptop and not on a build agent,
+    a LAN name the other way round. Links are recognised under ANY of the names; the fetch tries
+    them in declared order and moves on only when a name is unreachable (see `_fetch_forgejo`).
+    Declaring the names as ONE server, rather than as unrelated hosts, is what lets a link written
+    with one name be verified through another, and what lets the pending-on-default-branch rung
+    recognise this repo under all of them.
+
+    Each base is normalised `scheme://host[:port][/prefix]` — lowercase scheme and host, default
+    port dropped, no trailing slash. The prefix is for an instance served under a sub-path.
+    """
+    bases: Tuple[str, ...]
+
+    @property
+    def key(self) -> str:
+        """Identity of the server: its FIRST declared name. Stable for a given configuration."""
+        return self.bases[0]
+
+    def hostnames(self) -> frozenset:
+        return frozenset(urllib.parse.urlsplit(b).hostname or "" for b in self.bases)
+
+
+def _normalise_base(name: str) -> str:
+    """One declared name -> normalised base. Raises ValueError with a message meant for a human
+    reading a usage error: this is configuration, and a silently-dropped name would verify less
+    than the configuration claims — the false green every gate in this project is built against."""
+    raw = name.strip()
+    if not raw:
+        raise ValueError("an empty Forgejo name declares nothing")
+    if not raw.isascii() or _DISALLOWED_URL_CHARS_RE.search(raw):
+        raise ValueError(f"{raw!r}: not an ASCII URL without spaces or control characters")
+    try:
+        sp = urllib.parse.urlsplit(raw)
+        port = sp.port
+    except ValueError as e:
+        raise ValueError(f"{raw!r}: {e}") from None
+    if sp.scheme.lower() not in ("http", "https") or not sp.hostname:
+        # A bare host is refused, not completed with a guessed scheme: the same instance is often
+        # plain http on one name (a LAN port) and https on another, and guessing wrong verifies
+        # nothing while looking configured.
+        raise ValueError(f"{raw!r}: needs an explicit http:// or https:// scheme and a host")
+    if sp.username is not None or sp.password is not None:
+        raise ValueError(f"{raw!r}: credentials do not belong in a declared name (use FORGEJO_TOKEN)")
+    if sp.query or sp.fragment:
+        raise ValueError(f"{raw!r}: a base URL carries no query or fragment")
+    host = sp.hostname.lower()
+    if host in ("github.com", "www.github.com"):
+        raise ValueError(f"{raw!r}: github.com is recognised natively; it is not a Forgejo instance")
+    scheme = sp.scheme.lower()
+    default_port = {"http": 80, "https": 443}[scheme]
+    netloc = host if port in (None, default_port) else f"{host}:{port}"
+    return f"{scheme}://{netloc}{sp.path.rstrip('/')}"
+
+
+def parse_forgejo_servers(specs: Sequence[str]) -> Tuple[ForgejoServer, ...]:
+    """`--forgejo` values -> servers. Each spec is ONE server; its names are comma-separated.
+    A name declared twice (in one server or across two) is an error: it would make a link's server
+    depend on declaration order, which is a decision nobody wrote down."""
+    servers: List[ForgejoServer] = []
+    seen: Dict[str, str] = {}
+    for spec in specs:
+        bases: List[str] = []
+        for name in spec.split(","):
+            base = _normalise_base(name)
+            if base in seen:
+                raise ValueError(f"{base} is declared twice (also in {seen[base]!r})")
+            seen[base] = spec
+            bases.append(base)
+        servers.append(ForgejoServer(tuple(bases)))
+    return tuple(servers)
+
+
+# <owner>/<repo>/(src|raw)/(branch|tag|commit)/<ref>/<path...>, relative to a declared base. `media/`
+# is deliberately NOT recognised: it serves Git LFS objects, and the raw API would hand back the LFS
+# pointer — a text with no frontmatter — so a destination with a uuid would read as one without.
+_FORGEJO_FILE_RE = re.compile(
+    r"/(?P<owner>[^/]+)/(?P<repo>[^/]+)/(?:src|raw)/(?P<kind>branch|tag|commit)/(?P<ref>[^/]+)"
+    r"/(?P<path>[^#?]+)"
+)
+
+
+@dataclass(frozen=True)
 class GithubUrl:
+    """A parsed link to ONE FILE in a forge: GitHub (the default) or a declared Forgejo instance.
+
+    The name predates Forgejo support and is kept because it is part of the fetcher contract
+    (`Fetcher` receives one); `forge is None` means github.com, exactly as before."""
     owner: str
     repo: str
     ref: str
     path: str  # repo-relative POSIX path to the target file
+    #: None = github.com. Otherwise the declared Forgejo server the link was written against.
+    forge: Optional[ForgejoServer] = None
+    #: Forgejo only: `branch`, `tag` or `commit` — the URL says which, unlike GitHub's.
+    ref_kind: str = ""
+
+    @property
+    def token_var(self) -> str:
+        """The environment variable whose token belongs to this destination. Two variables, never
+        one: sending a GitHub token to a self-hosted server — or the other way round — hands a
+        credential to a host it was never issued for."""
+        return "FORGEJO_TOKEN" if self.forge is not None else "GITHUB_TOKEN"
+
+    def is_immutable_ref(self) -> bool:
+        """FR-006: a link that can never be fixed. On Forgejo the URL states it — `tag/` and
+        `commit/` — and a SHA-looking branch is judged exactly as on GitHub."""
+        if self.forge is not None and self.ref_kind in ("tag", "commit"):
+            return True
+        return _IMMUTABLE_REF_RE.fullmatch(self.ref) is not None
+
+    def raw_api_url(self, base: str) -> str:
+        """Forgejo raw-file API through ONE of the server's names:
+        `<base>/api/v1/repos/<owner>/<repo>/raw/<path>?ref=<ref>`. Encoded exactly like
+        `contents_api_url`, for the same reason."""
+        q = urllib.parse.quote
+        return (f"{base}/api/v1/repos/{q(self.owner, safe='%')}/{q(self.repo, safe='%')}"
+                f"/raw/{q(self.path, safe='/%')}?ref={q(self.ref, safe='%')}")
 
     def contents_api_url(self) -> str:
         """GitHub Contents API URL for this file. With `Accept: application/vnd.github.raw` it returns
@@ -106,9 +221,14 @@ class GithubUrl:
                 f"/contents/{q(self.path, safe='/%')}?ref={q(self.ref, safe='%')}")
 
 
-def parse_github_url(url: str) -> Optional[GithubUrl]:
+def parse_github_url(url: str, forgejo: Sequence[ForgejoServer] = ()) -> Optional[GithubUrl]:
     """Pure textual parse of a GitHub blob/raw URL into (owner, repo, ref, path). No network (FR-007).
     Returns None for any unrecognised shape — the caller reports it `web_unverifiable`, never crashes.
+
+    With `forgejo` servers declared, a file URL on one of their names is recognised too (the shape
+    `/<owner>/<repo>/src|raw/branch|tag|commit/<ref>/<path>`). Without them nothing changes: a
+    self-hosted forge is never GUESSED from a URL's shape, because any server can serve that shape
+    and fetching an arbitrary host's `/api/v1/` is not something a link checker should decide alone.
 
     **An href carrying a character `http.client` would refuse is rejected outright**, which is the
     conservative half of this fix and the reason it is safe. The tempting alternative — forbid those
@@ -121,9 +241,66 @@ def parse_github_url(url: str) -> Optional[GithubUrl]:
     if _DISALLOWED_URL_CHARS_RE.search(url):
         return None
     m = _GITHUB_BLOB_RE.match(url)
+    if m:
+        return GithubUrl(m["owner"], m["repo"], m["ref"], m["path"].rstrip("/"))
+    return _parse_forgejo_url(url, forgejo) if forgejo else None
+
+
+def _parse_forgejo_url(url: str, servers: Sequence[ForgejoServer]) -> Optional[GithubUrl]:
+    """Match `url` against the declared names. Scheme and port are part of the name: a link written
+    `http://` to a name declared `https://` is a different origin and is not recognised."""
+    if not url.isascii():
+        return None  # declared names are ASCII; a lookalike host must not casefold its way in
+    try:
+        sp = urllib.parse.urlsplit(url)
+        port = sp.port
+    except ValueError:
+        return None
+    scheme = sp.scheme.lower()
+    if scheme not in ("http", "https") or not sp.hostname or sp.username is not None:
+        return None
+    default_port = {"http": 80, "https": 443}[scheme]
+    netloc = sp.hostname.lower() if port in (None, default_port) else f"{sp.hostname.lower()}:{port}"
+    origin = f"{scheme}://{netloc}"
+    for server in servers:
+        for base in server.bases:
+            if not base.startswith(origin):
+                continue
+            # What follows the origin in the base: "" or a sub-path. When the origin is only a
+            # STRING prefix of the base's (`https://h` against a base `https://h:3000`) this is
+            # `:3000`, and no URL path — which always starts with `/` — can start with it.
+            prefix = base[len(origin):]
+            if not (sp.path == prefix or sp.path.startswith(prefix + "/")):
+                continue
+            m = _FORGEJO_FILE_RE.fullmatch(sp.path[len(prefix):])
+            if not m:
+                return None  # the right server, but not a link to a file: nothing to verify
+            return GithubUrl(m["owner"], m["repo"], m["ref"], m["path"].rstrip("/"),
+                             forge=server, ref_kind=m["kind"])
+    return None
+
+
+def forgejo_identity_of_remote(url: str, servers: Sequence[ForgejoServer]
+                               ) -> Optional[Tuple[str, str]]:
+    """A git remote URL -> (server key, `owner/repo` lowercased) when it points at a declared
+    Forgejo server, else None. Matched on the HOST only: a remote is usually SSH on its own port
+    while the declared names are the web origin, so scheme and port cannot be required to agree.
+    Accepts `scheme://[user@]host[:port]/…/owner/repo[.git]` and scp-like `[user@]host:owner/repo`."""
+    m = re.match(r"(?:[a-z][a-z0-9+.-]*://(?:[^/@]*@)?(?P<h1>[^/:]+)(?::\d+)?/(?P<p1>.+)"
+                 r"|(?:[^/@]*@)?(?P<h2>[^/:]+):(?P<p2>.+))\Z", url.strip(), re.IGNORECASE | re.ASCII)
     if not m:
         return None
-    return GithubUrl(m["owner"], m["repo"], m["ref"], m["path"].rstrip("/"))
+    host = (m["h1"] or m["h2"]).lower()
+    path = (m["p1"] or m["p2"]).rstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = [p for p in path.split("/") if p]
+    if len(parts) < 2:
+        return None
+    for server in servers:
+        if host in server.hostnames():
+            return (server.key, f"{parts[-2]}/{parts[-1]}".lower())
+    return None
 
 
 @dataclass(frozen=True)
@@ -220,15 +397,25 @@ Fetcher = Callable[[GithubUrl, Optional[str]], Tuple[int, Optional[str]]]
 _TRANSIENT_STATUSES = frozenset({404, 429, 500, 502, 503, 504, -1})
 
 
-def _fetch_once(gu: GithubUrl, token: Optional[str]) -> Tuple[int, Optional[str]]:
-    """One GitHub Contents API request (stdlib urllib). Sends the token when present (needed for private
-    repos, harmless/higher-rate for public). Never raises: maps HTTP and network errors to a status."""
-    req = urllib.request.Request(gu.contents_api_url(), headers={
-        "Accept": "application/vnd.github.raw",
-        "User-Agent": "darnlink-web-check",
-    })
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
+def _fetch_once(gu: GithubUrl, token: Optional[str],
+                base: Optional[str] = None) -> Tuple[int, Optional[str]]:
+    """One API request for the destination file (stdlib urllib). Sends the token when present (needed
+    for private repos, harmless/higher-rate for public). Never raises: maps HTTP and network errors to
+    a status. GitHub: the Contents API. A declared Forgejo: its raw API through `base`, one of the
+    server's names (the first when not given), with Forgejo's `token` authorization scheme."""
+    if gu.forge is None:
+        req = urllib.request.Request(gu.contents_api_url(), headers={
+            "Accept": "application/vnd.github.raw",
+            "User-Agent": "darnlink-web-check",
+        })
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+    else:
+        req = urllib.request.Request(gu.raw_api_url(base or gu.forge.key), headers={
+            "User-Agent": "darnlink-web-check",
+        })
+        if token:
+            req.add_header("Authorization", f"token {token}")
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             # `utf-8-sig`, like every LOCAL read in this package (frontmatter_edit, frontmatter_index):
@@ -286,6 +473,71 @@ def _repo_accessible(owner: str, repo: str, token: Optional[str]) -> bool:
         return True   # network blip: don't downgrade a persistent 404 to unverifiable on a transient error
 
 
+@lru_cache(maxsize=4096)
+def _forgejo_repo_accessible(base: str, owner: str, repo: str, token: Optional[str]) -> bool:
+    """`_repo_accessible` for a declared Forgejo, through one of its names. Forgejo, like GitHub,
+    answers 404 for a private repository the caller cannot see. Same fallbacks, same reasons."""
+    q = urllib.parse.quote
+    req = urllib.request.Request(f"{base}/api/v1/repos/{q(owner, safe='%')}/{q(repo, safe='%')}",
+                                 headers={"Accept": "application/json",
+                                          "User-Agent": "darnlink-web-check"})
+    if token:
+        req.add_header("Authorization", f"token {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status == 200
+    except urllib.error.HTTPError as e:
+        return e.code not in (403, 404)
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError):
+        return True
+
+
+#: Names of declared Forgejo servers that were UNREACHABLE (network error after every retry) in
+#: this process. Without it, a name that does not resolve where the run happens — the normal case
+#: for one of a server's names — would cost the full retry backoff on EVERY link before falling
+#: through to the name that works. Only the network sentinel lands here: an HTTP answer of any kind
+#: proves the name reaches the server. `_forgejo_unreachable.clear()` resets it (tests do).
+_forgejo_unreachable: set = set()
+
+
+def _default_attempts() -> int:
+    try:
+        return max(1, int(os.environ.get("DARNLINK_WEB_ATTEMPTS", "3")))
+    except ValueError:
+        return 3
+
+
+def _with_retries(call: Callable[[], Tuple[int, Optional[str]]], attempts: int,
+                  sleep) -> Tuple[int, Optional[str]]:
+    status, text = call()
+    for i in range(1, attempts):
+        if status not in _TRANSIENT_STATUSES:
+            break
+        sleep(min(0.5 * (2 ** (i - 1)), 4.0))  # 0.5s, 1.0s, 2.0s, … capped at 4s
+        status, text = call()
+    return status, text
+
+
+def _fetch_forgejo(gu: GithubUrl, token: Optional[str], attempts: int,
+                   sleep) -> Tuple[int, Optional[str]]:
+    """Try the server's names in declared order; the first that ANSWERS decides. A name that only
+    yields network errors is skipped — and remembered as unreachable for the rest of the run.
+    A 404 on a reachable name is never retried through another name: it is the server's answer,
+    and the other names are the same server."""
+    assert gu.forge is not None
+    for base in gu.forge.bases:
+        if base in _forgejo_unreachable:
+            continue
+        status, text = _with_retries(lambda: _fetch_once(gu, token, base), attempts, sleep)
+        if status == -1:
+            _forgejo_unreachable.add(base)
+            continue
+        if status == 404 and token and not _forgejo_repo_accessible(base, gu.owner, gu.repo, token):
+            return (-2, None)
+        return (status, text)
+    return (-1, None)
+
+
 def default_fetcher(gu: GithubUrl, token: Optional[str], *,
                     attempts: Optional[int] = None, sleep=time.sleep) -> Tuple[int, Optional[str]]:
     """Fetch the destination file, RETRYING transient statuses with short backoff so a flaky GitHub
@@ -300,16 +552,10 @@ def default_fetcher(gu: GithubUrl, token: Optional[str], *,
     is called broken. This lets `web:true` run on repos that link to client/third-party orgs without a
     wall of false breaks."""
     if attempts is None:
-        try:
-            attempts = max(1, int(os.environ.get("DARNLINK_WEB_ATTEMPTS", "3")))
-        except ValueError:
-            attempts = 3
-    status, text = _fetch_once(gu, token)
-    for i in range(1, attempts):
-        if status not in _TRANSIENT_STATUSES:
-            break
-        sleep(min(0.5 * (2 ** (i - 1)), 4.0))  # 0.5s, 1.0s, 2.0s, … capped at 4s
-        status, text = _fetch_once(gu, token)
+        attempts = _default_attempts()
+    if gu.forge is not None:
+        return _fetch_forgejo(gu, token, attempts, sleep)
+    status, text = _with_retries(lambda: _fetch_once(gu, token), attempts, sleep)
     if status == 404 and token and not _repo_accessible(gu.owner, gu.repo, token):
         return (-2, None)  # 404 in a repo we cannot read -> ambiguous, let _classify mark unverifiable
     return (status, text)
@@ -332,6 +578,9 @@ class WebFinding:
     # cannot touch, including in this very repo where all 14 are non-GitHub URLs and the figure is
     # identical with and without one. An alert that fires when it cannot help is learned and ignored.
     token_would_help: bool = False
+    #: Which variable would help when `token_would_help`: GitHub and a declared Forgejo take
+    #: DIFFERENT tokens, and advice naming the wrong one cannot be followed.
+    token_var: str = "GITHUB_TOKEN"
 
 
 @dataclass(frozen=True)
@@ -343,9 +592,12 @@ class OwnRepo:
     adversarial review walked through — the gate supports scanning a SUBDIRECTORY, and there `root`
     stops being the repo root while `<path>` stays relative to it.
     """
-    slug: str          # owner/repo of `origin`
+    slug: str          # owner/repo of `origin` on GitHub; "" when `origin` is not on GitHub
     root: Path         # `git rev-parse --show-toplevel`, NOT the scanned directory
     default_ref: str   # the default branch of `origin`, e.g. `main` or `master`
+    #: (server key, `owner/repo` lowercased) for every remote on a DECLARED Forgejo server — how
+    #: this same repository is named there. Empty when no server is declared.
+    forgejo_slugs: frozenset = frozenset()
 
 
 def _pendiente_en_la_rama_por_defecto(gu: "GithubUrl", own: Optional["OwnRepo"]) -> bool:
@@ -365,8 +617,18 @@ def _pendiente_en_la_rama_por_defecto(gu: "GithubUrl", own: Optional["OwnRepo"])
     #     this same reason; this comparison did not inherit that hardening.
     if not (gu.owner.isascii() and gu.repo.isascii()):
         return False
-    if f"{gu.owner}/{gu.repo}".lower() != own.slug.lower():
-        return False
+    if gu.forge is None:
+        if f"{gu.owner}/{gu.repo}".lower() != own.slug.lower():
+            return False
+    else:
+        # A declared Forgejo is this repo only when one of its REMOTES lives there under this slug
+        # (`OwnRepo.forgejo_slugs`) — never merely because the slug matches the GitHub one: the same
+        # `owner/repo` on two forges can be two different repositories. And only a `branch/` link
+        # can be pending: `tag/` and `commit/` say in the URL that nothing will move them.
+        if gu.ref_kind != "branch":
+            return False
+        if (gu.forge.key, f"{gu.owner}/{gu.repo}".lower()) not in own.forgejo_slugs:
+            return False
     # (2) THE REF MUST BE THE DEFAULT BRANCH. It is what the message claims ("resolves when this
     #     branch merges") and what went unchecked: a `blob/<sha>/x` or `blob/v1.0.0/x` is IMMUTABLE
     #     — it will never resolve — and was forgiven all the same. This file already ships the
@@ -422,6 +684,13 @@ def _classify(link: WebLink, gu: Optional[GithubUrl], status: int, dest_uuid: Op
     is dead either way. The exemption and the new finding live strictly inside the 200 branch."""
     if gu is None:
         return WebFinding("web_unverifiable", f, link.href, "not a recognised GitHub blob/raw URL")
+    if gu.forge is not None and status in (401, 403):
+        # A self-hosted server has no anonymous 60/h quota story to tell: a rejection is about
+        # credentials, and the variable to set is Forgejo's own.
+        why = (f"anonymous request rejected ({status}) — export FORGEJO_TOKEN to verify"
+               if not have_token else f"token rejected ({status})")
+        return WebFinding("web_unverifiable", f, link.href, f"cannot read destination: {why}",
+                          token_would_help=not have_token, token_var=gu.token_var)
     if status in (401, 403):
         # NOT "private repo": this function says so itself thirteen lines down — GitHub answers 404,
         # not 403, for a private repo we cannot see. So a tokenless 403 is essentially always the
@@ -453,7 +722,7 @@ def _classify(link: WebLink, gu: Optional[GithubUrl], status: int, dest_uuid: Op
             return WebFinding("web_unverifiable", f, link.href,
                               "destination 404s but no token — ambiguous (could be a private repo we "
                               "cannot see, not necessarily moved); a token is needed to call it broken",
-                              token_would_help=True)
+                              token_would_help=True, token_var=gu.token_var)
         # PENDING-ON-DEFAULT-BRANCH, not broken. A `blob/<default-branch>/…` URL to a path that
         # EXISTS in the working tree is not a dead link: it is a link that the merge will make
         # resolve. Calling it `web_not_found` in a blocking gate creates a DEADLOCK — the red
@@ -519,7 +788,7 @@ def _classify(link: WebLink, gu: Optional[GithubUrl], status: int, dest_uuid: Op
                               "uuid that is not a string) — a different defect from a missing uuid")
         if (owned
                 and gu.path.lower().endswith(".md")           # FR-005
-                and not _IMMUTABLE_REF_RE.fullmatch(gu.ref)   # FR-006
+                and not gu.is_immutable_ref()                 # FR-006
                 and not filtered):                            # FR-014
             return WebFinding("web_own_no_uuid", f, link.href,
                               f"destination is yours ({gu.owner}/{gu.repo}) and {gu.path} has no uuid "
@@ -545,6 +814,8 @@ def check_web_links_online(
     out_of_root: Optional[List[Path]] = None,
     include_mermaid: bool = False,
     own: Optional["OwnRepo"] = None,
+    forgejo: Sequence[ForgejoServer] = (),
+    forgejo_token: Optional[str] = None,
 ) -> Tuple[List[WebFinding], Dict[Path, str]]:
     """Fetch each web link's destination (once, cached per URL) and classify it. Returns the findings
     and the per-file rewritten content for any `web_anchor` (the caller writes it only under --write).
@@ -552,14 +823,16 @@ def check_web_links_online(
 
     `excludes` is a set of directory-name globs to skip (same semantics as the other commands); a
     repo with vendored `clones/` of foreign repos MUST exclude them so their internal web links aren't
-    fetched/anchored. Defaults to the shared `DEFAULT_EXCLUDES`."""
+    fetched/anchored. Defaults to the shared `DEFAULT_EXCLUDES`.
+
+    `forgejo` declares self-hosted Forgejo servers whose file links are verified like GitHub's;
+    their destinations are fetched with `forgejo_token`, never with the GitHub `token`."""
     from .frontmatter_index import iter_markdown_files, DEFAULT_EXCLUDES
     from .frontmatter_edit import read_text_keep_newlines
     from .links import file_ignores_links, file_is_ignored
 
     if excludes is None:
         excludes = DEFAULT_EXCLUDES
-    have_token = bool(token)
     cache: Dict[str, Tuple[int, Optional[str]]] = {}  # href -> (status, text)
     findings: List[WebFinding] = []
     edits: Dict[Path, str] = {}
@@ -584,13 +857,15 @@ def check_web_links_online(
         cursor = 0
         changed = False
         for link in links:
-            gu = parse_github_url(link.href)
+            gu = parse_github_url(link.href, forgejo)
             if gu is None:
-                findings.append(_classify(link, None, 0, None, have_token, f, owners,
+                findings.append(_classify(link, None, 0, None, bool(token), f, owners,
                                           own=own))
                 continue
+            link_token = forgejo_token if gu.forge is not None else token
+            have_token = bool(link_token)
             if link.href not in cache:
-                cache[link.href] = fetcher(gu, token)
+                cache[link.href] = fetcher(gu, link_token)
             status, text = cache[link.href]
             # `lstrip("\ufeff")` as well as the `utf-8-sig` decode in `_fetch_once`, and not instead of
             # it: the decode fixes the wire, this fixes the TEXT, whatever produced it. A BOM in front

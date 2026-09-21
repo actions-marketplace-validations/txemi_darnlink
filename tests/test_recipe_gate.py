@@ -748,6 +748,58 @@ def test_absent_keys_leave_the_command_line_untouched(sandbox, tmp_path):
     assert web and "--own" not in web[0], web
 
 
+# --- forgejo_web: feature 018 (declared self-hosted Forgejo instances) ---
+
+_FJ = "https://forge.example.test,http://forge.lan.example.test:3000"
+
+
+def test_the_forgejo_key_reaches_the_cli_one_flag_per_instance(sandbox, tmp_path):
+    """Asserted on the INVOCATION, for the reason given above: the verdict cannot tell."""
+    repo, run = sandbox
+    _owned_web_link_without_uuid(repo)
+    log = tmp_path / "argv.log"
+
+    run({"mode": "max", "web": True, "forgejo_web": [_FJ, "https://other.example.test"]},
+        argv_log=log)
+
+    web = [l for l in log.read_text().splitlines() if "web-check" in l]
+    assert web, log.read_text()
+    assert f"--forgejo {_FJ}" in web[0] and "--forgejo https://other.example.test" in web[0]
+
+
+def test_without_the_forgejo_key_the_command_line_is_untouched(sandbox, tmp_path):
+    repo, run = sandbox
+    _owned_web_link_without_uuid(repo)
+    log = tmp_path / "argv.log"
+
+    run({"mode": "max", "web": True}, argv_log=log)
+
+    web = [l for l in log.read_text().splitlines() if "web-check" in l]
+    assert web and "--forgejo" not in web[0], web
+
+
+def test_a_malformed_forgejo_entry_is_reported_as_config(sandbox):
+    repo, run = sandbox
+    _owned_web_link_without_uuid(repo)
+
+    r = run({"mode": "max", "web": True, "forgejo_web": ["forge.example.test"]})
+
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "CONFIG" in out and "forgejo_web" in out
+
+
+def test_a_declared_forgejo_without_a_token_says_so(sandbox, tmp_path):
+    repo, run = sandbox
+    _owned_web_link_without_uuid(repo)
+
+    r = run({"mode": "max", "web": True, "forgejo_web": [_FJ]},
+            extra_env={"FORGEJO_TOKEN": "",
+                       "DARNLINK_GATE_FORGEJO_TOKEN_FILE": str(tmp_path / "absent")})
+
+    assert "no FORGEJO_TOKEN" in r.stdout + r.stderr
+
+
 def test_an_exit_1_is_NOT_swallowed_for_a_repo_that_never_opted_in(sandbox, tmp_path):
     """The blocking defect this pass shipped with: the swallow was unconditional, so ANY exit 1 —
     `uvx` failing on its own, an uncaught Python exception — turned green for every consumer with
