@@ -70,6 +70,10 @@ def emit_web_anchor(text: str, href: str, uuid: str) -> str:
     `web-uuid` (not `uuid`) keeps it invisible to the core's marker (see FR-002)."""
     return f"[{text}]({href}) <!-- web-uuid: {uuid} -->"
 
+#: The GitHub REST API. One constant rather than a literal per call site: it is also the ONLY origin
+#: a GITHUB_TOKEN may be sent to, including after a redirect (`_github_open`).
+_GITHUB_API = "https://api.github.com"
+
 # github.com/<owner>/<repo>/blob/<ref>/<path...>  (also tolerates /raw/ and a leading www.)
 _GITHUB_BLOB_RE = re.compile(
     r"https?://(?:www\.)?github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/(?:blob|raw)/(?P<ref>[^/]+)/(?P<path>[^#?]+)"
@@ -217,7 +221,7 @@ class GithubUrl:
         `safe="/%"` on the path leaves an href that is already encoded alone, so a link written with
         `%20` does not become `%2520`."""
         q = urllib.parse.quote
-        return (f"https://api.github.com/repos/{q(self.owner, safe='%')}/{q(self.repo, safe='%')}"
+        return (f"{_GITHUB_API}/repos/{q(self.owner, safe='%')}/{q(self.repo, safe='%')}"
                 f"/contents/{q(self.path, safe='/%')}?ref={q(self.ref, safe='%')}")
 
 
@@ -434,10 +438,26 @@ class _ScopedAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
         return new
 
 
+def _scoped_open(allowed_origins: frozenset, req: "urllib.request.Request", timeout: int):
+    """`urlopen`, except that a request carrying `Authorization` follows redirects through
+    `_ScopedAuthRedirectHandler`, so the credential never leaves `allowed_origins`. A request with
+    no credential has nothing to leak and goes through plain `urlopen`."""
+    if not req.has_header("Authorization"):
+        return urllib.request.urlopen(req, timeout=timeout)
+    return urllib.request.build_opener(_ScopedAuthRedirectHandler(allowed_origins)).open(
+        req, timeout=timeout)
+
+
 def _forgejo_open(server: ForgejoServer, req: "urllib.request.Request", timeout: int):
     """`urlopen` for a declared Forgejo: redirects may not carry the token off its names."""
-    allowed = frozenset(o for o in (_origin_of(b) for b in server.bases) if o)
-    return urllib.request.build_opener(_ScopedAuthRedirectHandler(allowed)).open(req, timeout=timeout)
+    return _scoped_open(frozenset(o for o in (_origin_of(b) for b in server.bases) if o), req, timeout)
+
+
+def _github_open(req: "urllib.request.Request", timeout: int):
+    """`urlopen` for the GitHub API: redirects may not carry GITHUB_TOKEN off `_GITHUB_API`. The API
+    does redirect (a renamed repository answers 301 to its new location on the same host), and
+    urllib would otherwise copy the header onto a redirect to ANY host."""
+    return _scoped_open(frozenset({_origin_of(_GITHUB_API)}), req, timeout)
 
 
 def _fetch_once(gu: GithubUrl, token: Optional[str],
@@ -460,7 +480,7 @@ def _fetch_once(gu: GithubUrl, token: Optional[str],
         if token:
             req.add_header("Authorization", f"token {token}")
     try:
-        opened = (urllib.request.urlopen(req, timeout=15) if gu.forge is None
+        opened = (_github_open(req, 15) if gu.forge is None
                   else _forgejo_open(gu.forge, req, 15))
         with opened as resp:
             # `utf-8-sig`, like every LOCAL read in this package (frontmatter_edit, frontmatter_index):
@@ -498,7 +518,7 @@ def _repo_accessible(owner: str, repo: str, token: Optional[str]) -> bool:
     a client org our RO PAT has no access to) — there a file 404 is ambiguous, not a break. Cached per
     (owner, repo, token) so a repo linked N times is probed once. On a network blip, returns True
     (fall back to the plain 404=broken behaviour rather than hide a real break). Never raises."""
-    url = (f"https://api.github.com/repos/{urllib.parse.quote(owner, safe='%')}"
+    url = (f"{_GITHUB_API}/repos/{urllib.parse.quote(owner, safe='%')}"
            f"/{urllib.parse.quote(repo, safe='%')}")
     req = urllib.request.Request(url, headers={
         "Accept": "application/vnd.github+json",
@@ -507,7 +527,7 @@ def _repo_accessible(owner: str, repo: str, token: Optional[str]) -> bool:
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with _github_open(req, 15) as resp:
             return resp.status == 200
     except urllib.error.HTTPError as e:
         if e.code in (403, 404):
