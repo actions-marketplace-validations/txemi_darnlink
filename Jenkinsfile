@@ -111,7 +111,19 @@ pipeline {
 
         stage('windows') {
           agent { label 'windows' }
+          environment { PATH = "${env.USERPROFILE}\\.local\\bin;${env.PATH}" }
           stages {
+            // Same job as astral-sh/setup-uv in the workflows: a per-user install, only if missing.
+            stage('setup uv') {
+              steps {
+                powershell '''
+                  if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+                    Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression
+                  }
+                  uv --version
+                '''
+              }
+            }
             stage('local gates') {
               steps { script { PYTHONS.each { py -> stage("local gates py${py} (windows)") { localGates(py, false) } } } }
             }
