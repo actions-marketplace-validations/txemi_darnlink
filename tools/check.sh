@@ -64,5 +64,6 @@ uv run darnlink . --robustify --create-frontmatter --no-create-frontmatter-for R
 # Dangling axis (dogfood `dangling: repo`, the strictest rung the recipe offers). Runs LAST
 # because it shells out to darnlink again; see tools/dangling_gate.py for why it lives in its own
 # file and why it is fail-closed at zero.
-python3 tools/dangling_gate.py
+# `uv run python`, not `python3`: Windows ships no python3 command, and this is the project env.
+uv run python tools/dangling_gate.py
 
