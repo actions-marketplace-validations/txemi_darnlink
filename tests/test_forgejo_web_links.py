@@ -42,8 +42,10 @@ def _fresh_state():
 
 
 def _w(p: Path, text: str) -> None:
+    """Bytes, not `write_text`: on Windows that turns every `\n` into `\r\n`, and the anchoring test
+    compares the rewritten file byte for byte (darnlink preserves the line endings it finds)."""
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(text, encoding="utf-8")
+    p.write_bytes(text.encode("utf-8"))
 
 
 def _with_uuid(u=UUID):
