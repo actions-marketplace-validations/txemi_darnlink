@@ -143,6 +143,19 @@ def test_a_sub_path_install_only_matches_under_its_prefix():
     assert parse_github_url("https://example.test/gitx/o/r/src/branch/main/a.md", servers) is None
 
 
+@pytest.mark.parametrize("specs", [
+    ["https://example.test,https://example.test/sub"],      # one server, root name listed first
+    ["https://example.test/sub,https://example.test"],
+    ["https://example.test", "https://example.test/sub"],    # two servers sharing a host
+])
+def test_a_sub_path_name_wins_over_a_root_name_on_the_same_host(specs):
+    servers = parse_forgejo_servers(specs)
+    gu = parse_github_url("https://example.test/sub/o/r/src/branch/main/a.md", servers)
+    assert gu is not None and (gu.owner, gu.repo, gu.path) == ("o", "r", "a.md")
+    assert "https://example.test/sub" in gu.forge.bases
+    assert parse_github_url("https://example.test/o/r/src/branch/main/a.md", servers).owner == "o"
+
+
 def test_github_parsing_is_unchanged_by_a_declaration():
     assert parse_github_url(GH, SERVER) == GithubUrl("acme", "handbook", "main", "docs/a.md")
 

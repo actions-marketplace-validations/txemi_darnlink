@@ -262,6 +262,11 @@ def _parse_forgejo_url(url: str, servers: Sequence[ForgejoServer]) -> Optional[G
     default_port = {"http": 80, "https": 443}[scheme]
     netloc = sp.hostname.lower() if port in (None, default_port) else f"{sp.hostname.lower()}:{port}"
     origin = f"{scheme}://{netloc}"
+    # Every declared name on this origin, MOST SPECIFIC PREFIX FIRST, across all servers. Declaration
+    # order must not decide: with `https://h` and `https://h/sub` both declared, the root name always
+    # matches `/sub/o/r/…` as a path, so trying it first read `sub` as the owner and gave up on a link
+    # the sub-path name recognises.
+    candidates = []
     for server in servers:
         for base in server.bases:
             if not base.startswith(origin):
@@ -270,14 +275,14 @@ def _parse_forgejo_url(url: str, servers: Sequence[ForgejoServer]) -> Optional[G
             # STRING prefix of the base's (`https://h` against a base `https://h:3000`) this is
             # `:3000`, and no URL path — which always starts with `/` — can start with it.
             prefix = base[len(origin):]
-            if not (sp.path == prefix or sp.path.startswith(prefix + "/")):
-                continue
-            m = _FORGEJO_FILE_RE.fullmatch(sp.path[len(prefix):])
-            if not m:
-                return None  # the right server, but not a link to a file: nothing to verify
+            if sp.path == prefix or sp.path.startswith(prefix + "/"):
+                candidates.append((len(prefix), server, prefix))
+    for _, server, prefix in sorted(candidates, key=lambda c: -c[0]):
+        m = _FORGEJO_FILE_RE.fullmatch(sp.path[len(prefix):])
+        if m:
             return GithubUrl(m["owner"], m["repo"], m["ref"], m["path"].rstrip("/"),
                              forge=server, ref_kind=m["kind"])
-    return None
+    return None  # no declared name sees a link to a file here: nothing to verify
 
 
 def forgejo_identity_of_remote(url: str, servers: Sequence[ForgejoServer]
