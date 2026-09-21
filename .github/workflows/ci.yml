@@ -67,33 +67,7 @@ jobs:
       # the COMMITS, so `synchronize` — already a trigger here — is exactly when it must re-run.
       - name: English-only gate — commit messages added by this PR
         if: github.event_name == 'pull_request'
-        run: |
-          # ONE MESSAGE AT A TIME. Feeding `git log --format=%B` concatenated defeats layer 3,
-          # which judges the text as a single block: measured, ONE English line alongside a Spanish
-          # subject is enough to dilute it past detection, and the repo's normal commit shape --
-          # short subject, long English body -- was missed entirely. The compensating control this
-          # workflow is supposed to provide for the hook's known gap did not exist.
-          fail=0
-          while IFS= read -r sha; do
-            [ -z "$sha" ] && continue
-            git log -1 --format=%B "$sha" > "$RUNNER_TEMP/one.txt"
-            # NO --strict. It was added here as the compensating control for the hook's known gap,
-            # and then measured: layer 3 classifies "hooks: apply darnlang to darnlang" as Tagalog
-            # at 0.86 confidence, and "ci: uv venv --clear, setup-uv makes one" as Estonian -- both
-            # perfectly English. A subject is mostly identifiers and two repetitions of an invented
-            # word dominate it; no threshold on confidence, length or word count separates those
-            # from real findings, which score identically. On a PUBLIC repo that means blocking a
-            # contributor's honest English commit, which is how a gate gets routed around.
-            #
-            # So the gap stays OPEN and stated: a short subject with no accent and none of the
-            # stopwords passes every surface here. A compensating control that does not work is
-            # worse than a hole you can see. Layer 3 keeps the surfaces where it was measured to
-            # work -- issue bodies and PR descriptions, which are prose.
-            darnlang prose "$RUNNER_TEMP/one.txt" \
-              --label "commit message $sha" || fail=1
-          done < <(git log --format=%H \
-            "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}")
-          exit "$fail"
+        run: bash tools/lang_commits.sh "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
 
   # Exercises the commands users actually run (packaging + entry point + the literal README
   # one-liner) on Linux AND Windows — so the copy-paste one-liner is proven on both.
@@ -124,9 +98,4 @@ jobs:
       - uses: actions/checkout@v4
       - name: Parse recipes/darnlink-gate.ps1
         shell: pwsh
-        run: |
-          $errs = $null
-          [void][System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path recipes/darnlink-gate.ps1).Path, [ref]$null, [ref]$errs)
-          if ($errs) { $errs | ForEach-Object { Write-Host "::error::$($_.ToString())" }; exit 1 }
-          Write-Host "recipes/darnlink-gate.ps1 parses clean"
+        run: ./tools/ps1_syntax.ps1
