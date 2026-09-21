@@ -69,6 +69,26 @@ is that orchestration in one place; a consumer carries only a tiny config + a 3-
   | `default_branch` | string | the repo's default branch, e.g. `main`. **Declare it in CI**: a multibranch PR job fetches only the pull ref, so there is no `origin/HEAD`, and `ls-remote` usually has no credentials there — without this the pending-vs-broken rung goes INERT exactly where it is needed. It says so on stderr when it does |
   | `own_web_max` | int | a budget, so the rung is adoptable before the repo reaches zero. **Non-numeric counts as ABSENT, never as infinite** — widening an allowance is the one direction a config typo must not be able to go |
 
+- `forgejo_web` (opt-in, **needs `web`**) → feature 018. Links to a **self-hosted Forgejo** are
+  only recognised once the instance is declared; then its file links
+  (`/<owner>/<repo>/src|raw/branch|tag|commit/<ref>/<path>`) are verified and anchored exactly like
+  GitHub's, through its raw API (`/api/v1/repos/<owner>/<repo>/raw/<path>?ref=<ref>`).
+
+  | key | Value | Meaning |
+  |---|---|---|
+  | `forgejo_web` | list of strings | **one entry per instance**; if it answers to several names, list them all in that entry, comma-separated, **with scheme and port**: `"https://forge.example.test,http://forge.lan.example.test:3000"` |
+
+  Links are recognised under **any** of an instance's names, and fetched through the **first
+  name that is reachable** from where the gate runs — a laptop and a build agent often resolve
+  different names for the same server. A name that is unreachable is skipped for the rest of the
+  run. A bare host is refused rather than completed with a guessed scheme.
+
+  The token is **`FORGEJO_TOKEN`** (or the file in `DARNLINK_GATE_FORGEJO_TOKEN_FILE`, default
+  `~/.config/forgejo_token_ro`), sent as `Authorization: token …`. It is never sent to GitHub, and
+  `GITHUB_TOKEN` is never sent to a Forgejo. `own_web` owners apply on a declared Forgejo too, and
+  the pending-on-default-branch rung recognises this repository there through **any git remote**
+  whose host is one of the instance's names — so a repo moving between forges keeps it.
+
 - `include_mermaid` (opt-in, **needs `web`**) → feature 017. A `mermaid` diagram carries its
   destinations in `click` directives, which sit inside a fenced block and are therefore invisible to
   every axis. With this key the **read** axis sees them; the write operations still never look
