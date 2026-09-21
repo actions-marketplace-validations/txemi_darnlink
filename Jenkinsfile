@@ -113,12 +113,13 @@ pipeline {
           agent { label 'windows' }
           environment { PATH = "${env.USERPROFILE}\\.local\\bin;${env.PATH}" }
           stages {
-            // Same job as astral-sh/setup-uv in the workflows: a per-user install, only if missing.
+            // Same job as astral-sh/setup-uv in the workflows: a per-user install, only if missing,
+            // pinned to the version the first green Windows run used.
             stage('setup uv') {
               steps {
                 powershell '''
                   if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-                    Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression
+                    Invoke-RestMethod https://astral.sh/uv/0.12.17/install.ps1 | Invoke-Expression
                   }
                   uv --version
                 '''
