@@ -115,7 +115,8 @@ pipeline {
                       [ -n "$candidate" ] || continue
                       sha="$(git rev-parse --verify --quiet "${candidate}^{commit}")" || continue
                       [ "$sha" != "$head" ] || continue
-                      git merge-base --is-ancestor "$sha" "$head" || [ -n "${CHANGE_TARGET:-}" ] || continue
+                      # The target branch of a pull request is the one candidate that need not be an ancestor.
+                      git merge-base --is-ancestor "$sha" "$head" || [ "$candidate" = "origin/${CHANGE_TARGET:-}" ] || continue
                       base="$sha"
                       break
                     done
@@ -148,7 +149,11 @@ pipeline {
               steps { script { PYTHONS.each { py -> stage("local gates py${py} (windows)") { localGates(py, false) } } } }
             }
             stage('smoke') {
-              steps { bat 'uvx --from . darnlink .' }
+              steps {
+                bat 'uvx --from . darnlink .'
+                // Same second step as the workflow, over git from the workspace (see the Linux stage).
+                bat 'for /f %%s in (\'git rev-parse HEAD\') do uvx --from "git+file:///%WORKSPACE:\\=/%@%%s" darnlink .'
+              }
             }
             stage('ps1-syntax') {
               steps { powershell './tools/ps1_syntax.ps1' }
