@@ -6,6 +6,13 @@ All notable changes to darnlink are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- `web-check` no longer lets `GITHUB_TOKEN` follow a redirect to another host. urllib copies
+  `Authorization` onto a redirected request whatever its destination; requests to the GitHub API now
+  keep the token only while the redirect stays on the API origin (a renamed repository's same-host
+  301 still works). Same guard the declared-Forgejo path got when it was introduced.
+
 ### Web links to a declared self-hosted Forgejo are verified like GitHub's (feature 018)
 
 Until now `web-check` only recognised `github.com` file URLs; a link to a self-hosted Forgejo was

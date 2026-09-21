@@ -688,3 +688,81 @@ def test_a_percent_encoded_path_still_resolves(tmp_path):
                                          own=_own(tmp_path, ref="main"))
     assert findings[0].kind == "web_unverifiable"
     assert "TRACKED FILE" in findings[0].detail
+
+
+# --- redirects must not carry GITHUB_TOKEN off the API origin ---------------------------------
+# Real loopback sockets: the leak lives inside urllib's redirect handling, so a mocked `urlopen`
+# would skip exactly the code under test. `_GITHUB_API` is pointed at the first server.
+
+def _loopback(body):
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body(self)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _record_auth(seen):
+    def body(h):
+        seen.append(h.headers.get("Authorization"))
+        h.send_response(200)
+        h.end_headers()
+        h.wfile.write(b"---\nuuid: x\n---\n")
+    return body
+
+
+def _redirect_to(location):
+    def body(h):
+        h.send_response(302)
+        h.send_header("Location", location)
+        h.end_headers()
+    return body
+
+
+@pytest.mark.parametrize("probe", ["file", "repo"])
+def test_github_token_does_not_follow_a_redirect_to_another_host(monkeypatch, probe):
+    import darnlink.weblinks as wl
+    seen = []
+    target = _loopback(_record_auth(seen))
+    api = _loopback(_redirect_to(f"http://127.0.0.1:{target.server_port}/elsewhere"))
+    monkeypatch.setattr(wl, "_GITHUB_API", f"http://127.0.0.1:{api.server_port}")
+    try:
+        if probe == "file":
+            assert wl._fetch_once(GithubUrl("o", "r", "main", "a.md"), "SECRET")[0] == 200
+        else:
+            wl._repo_accessible.cache_clear()
+            assert wl._repo_accessible("o", "r", "SECRET") is True
+            wl._repo_accessible.cache_clear()
+        assert seen == [None]
+    finally:
+        api.shutdown()
+        target.shutdown()
+
+
+def test_github_token_survives_a_redirect_within_the_api_origin(monkeypatch):
+    """A renamed repository answers 301 on the SAME host; dropping the token there would turn every
+    private destination behind a rename into a false 404."""
+    import darnlink.weblinks as wl
+    seen = []
+
+    def body(h):
+        if h.path.startswith("/moved"):
+            _record_auth(seen)(h)
+        else:
+            _redirect_to("/moved/a.md")(h)
+
+    api = _loopback(body)
+    monkeypatch.setattr(wl, "_GITHUB_API", f"http://127.0.0.1:{api.server_port}")
+    try:
+        assert wl._fetch_once(GithubUrl("o", "r", "main", "a.md"), "SECRET")[0] == 200
+        assert seen == ["Bearer SECRET"]
+    finally:
+        api.shutdown()
