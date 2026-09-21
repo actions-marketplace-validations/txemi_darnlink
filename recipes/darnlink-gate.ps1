@@ -231,7 +231,7 @@ if ($scope -ne 'staged') {
 # whole-tree reasoning, and per the wall architecture the staged pre-commit stays fast — max is
 # enforced at the whole-repo wall (pre-push / CI). See docs/elevating-your-link-gate.md §7.
 $staged = @(git diff --cached --name-only --diff-filter=ACMR -- '*.md' 2>$null)
-if (-not $staged) { Write-Output "darnlink-gate (staged): no staged .md — nothing to judge."; exit 0 }
+if (-not $staged) { Write-Output "darnlink-gate (staged): no staged .md - nothing to judge."; exit 0 }
 
 $json = (& uvx --from $ref darnlink check . --json @dlArgs 2>$null | Out-String)
 $rc = $LASTEXITCODE
