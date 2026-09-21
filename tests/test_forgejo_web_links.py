@@ -3,8 +3,10 @@
 Every host here is under `example.test` (RFC 2606): nothing resolves, and no test touches the network
 — the fetch layer is injected, or `urlopen` / `_fetch_once` are monkeypatched.
 """
+import http.server
 import os
 import subprocess
+import threading
 import urllib.error
 from pathlib import Path
 
@@ -247,7 +249,7 @@ def test_the_request_goes_to_the_raw_api_with_forgejos_auth_scheme(monkeypatch):
         seen["url"], seen["auth"] = req.full_url, req.get_header("Authorization")
         return Resp()
 
-    monkeypatch.setattr(wl.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(wl, "_forgejo_open", lambda server, req, timeout: fake_urlopen(req, timeout))
     gu = parse_github_url(FILE, SERVER)
     assert wl._fetch_once(gu, "fj", LAN)[0] == 200
     assert seen == {"url": f"{LAN}/api/v1/repos/acme/handbook/raw/docs/a.md?ref=main",
@@ -287,17 +289,17 @@ def test_every_name_unreachable_is_a_network_error(monkeypatch):
 def test_a_404_in_a_repo_the_token_cannot_read_is_ambiguous(monkeypatch):
     monkeypatch.setattr(wl, "_fetch_once", lambda gu, t, base=None: (404, None))
     gu = parse_github_url(FILE, SERVER)
-    monkeypatch.setattr(wl, "_forgejo_repo_accessible", lambda b, o, r, t: False)
+    monkeypatch.setattr(wl, "_forgejo_repo_accessible", lambda s, b, o, r, t: False)
     assert wl.default_fetcher(gu, "fj", attempts=1, sleep=lambda _s: None) == (-2, None)
-    monkeypatch.setattr(wl, "_forgejo_repo_accessible", lambda b, o, r, t: True)
+    monkeypatch.setattr(wl, "_forgejo_repo_accessible", lambda s, b, o, r, t: True)
     assert wl.default_fetcher(gu, "fj", attempts=1, sleep=lambda _s: None) == (404, None)
 
 
 def test_repo_probe_maps_404_to_not_readable(monkeypatch):
-    def boom(req, timeout=None):
+    def boom(server, req, timeout=None):
         raise urllib.error.HTTPError(req.full_url, 404, "nf", {}, None)
-    monkeypatch.setattr(wl.urllib.request, "urlopen", boom)
-    assert wl._forgejo_repo_accessible(TS, "acme", "handbook", "fj") is False
+    monkeypatch.setattr(wl, "_forgejo_open", boom)
+    assert wl._forgejo_repo_accessible(SERVER[0], TS, "acme", "handbook", "fj") is False
 
 
 # --- this repo on a Forgejo: pending on the default branch ------------------------------------
@@ -393,3 +395,69 @@ def test_the_summary_names_the_variable_that_would_help(tmp_path, monkeypatch, c
     out = capsys.readouterr().out
     assert rc == 0
     assert "1 of them would resolve with FORGEJO_TOKEN" in out and "GITHUB_TOKEN" not in out
+
+
+# --- redirects must not carry the token off the declared names ---------------------------------
+# Real sockets, loopback only: the leak lives inside urllib's redirect handling, and a mocked
+# `urlopen` would skip exactly the code under test.
+
+def _serve(handler_body):
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            handler_body(self)
+        def log_message(self, *a):
+            pass
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _recorder(seen):
+    def body(h):
+        seen.append(h.headers.get("Authorization"))
+        h.send_response(200)
+        h.end_headers()
+        h.wfile.write(b"---\nuuid: " + UUID.encode() + b"\n---\n")
+    return body
+
+
+def _redirector(location):
+    def body(h):
+        h.send_response(302)
+        h.send_header("Location", location)
+        h.end_headers()
+    return body
+
+
+@pytest.mark.parametrize("probe", ["file", "repo"])
+def test_a_redirect_to_an_undeclared_host_does_not_get_the_token(probe):
+    seen = []
+    target = _serve(_recorder(seen))
+    source = _serve(_redirector(f"http://127.0.0.1:{target.server_port}/elsewhere"))
+    try:
+        servers = parse_forgejo_servers([f"http://127.0.0.1:{source.server_port}"])
+        gu = parse_github_url(f"http://127.0.0.1:{source.server_port}/o/r/src/branch/main/a.md",
+                              servers)
+        if probe == "file":
+            assert wl._fetch_once(gu, "SECRET")[0] == 200
+        else:
+            wl._forgejo_repo_accessible(servers[0], servers[0].key, "o", "r", "SECRET")
+        assert seen == [None]
+    finally:
+        source.shutdown(); target.shutdown()
+
+
+def test_a_redirect_between_declared_names_keeps_the_token():
+    seen = []
+    target = _serve(_recorder(seen))
+    source = _serve(_redirector(f"http://127.0.0.1:{target.server_port}/api/v1/x"))
+    try:
+        servers = parse_forgejo_servers(
+            [f"http://127.0.0.1:{source.server_port},http://127.0.0.1:{target.server_port}"])
+        gu = parse_github_url(f"http://127.0.0.1:{source.server_port}/o/r/src/branch/main/a.md",
+                              servers)
+        status, text = wl._fetch_once(gu, "SECRET")
+        assert status == 200 and UUID in text
+        assert seen == ["token SECRET"]
+    finally:
+        source.shutdown(); target.shutdown()

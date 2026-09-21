@@ -402,6 +402,44 @@ Fetcher = Callable[[GithubUrl, Optional[str]], Tuple[int, Optional[str]]]
 _TRANSIENT_STATUSES = frozenset({404, 429, 500, 502, 503, 504, -1})
 
 
+def _origin_of(url: str) -> Optional[str]:
+    """`scheme://host[:port]`, normalised exactly like a declared name (default port dropped)."""
+    try:
+        sp = urllib.parse.urlsplit(url)
+        port = sp.port
+    except ValueError:
+        return None
+    scheme = sp.scheme.lower()
+    if scheme not in ("http", "https") or not sp.hostname:
+        return None
+    default_port = {"http": 80, "https": 443}[scheme]
+    host = sp.hostname.lower()
+    return f"{scheme}://{host}" if port in (None, default_port) else f"{scheme}://{host}:{port}"
+
+
+class _ScopedAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects, but keep `Authorization` ONLY while the target is one of the server's
+    declared names. urllib's own handler copies every non-content header onto the redirected
+    request — measured: a 302 from a declared name to another host:port delivered the token there,
+    breaking the one promise this feature makes about credentials."""
+
+    def __init__(self, allowed_origins: frozenset):
+        super().__init__()
+        self.allowed_origins = allowed_origins
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and _origin_of(newurl) not in self.allowed_origins:
+            new.remove_header("Authorization")
+        return new
+
+
+def _forgejo_open(server: ForgejoServer, req: "urllib.request.Request", timeout: int):
+    """`urlopen` for a declared Forgejo: redirects may not carry the token off its names."""
+    allowed = frozenset(o for o in (_origin_of(b) for b in server.bases) if o)
+    return urllib.request.build_opener(_ScopedAuthRedirectHandler(allowed)).open(req, timeout=timeout)
+
+
 def _fetch_once(gu: GithubUrl, token: Optional[str],
                 base: Optional[str] = None) -> Tuple[int, Optional[str]]:
     """One API request for the destination file (stdlib urllib). Sends the token when present (needed
@@ -422,7 +460,9 @@ def _fetch_once(gu: GithubUrl, token: Optional[str],
         if token:
             req.add_header("Authorization", f"token {token}")
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        opened = (urllib.request.urlopen(req, timeout=15) if gu.forge is None
+                  else _forgejo_open(gu.forge, req, 15))
+        with opened as resp:
             # `utf-8-sig`, like every LOCAL read in this package (frontmatter_edit, frontmatter_index):
             # a Windows-authored destination arrives with a BOM, plain utf-8 leaves it in front of the
             # `---`, and the frontmatter reader then sees no frontmatter at all. Before feature 016
@@ -479,7 +519,8 @@ def _repo_accessible(owner: str, repo: str, token: Optional[str]) -> bool:
 
 
 @lru_cache(maxsize=4096)
-def _forgejo_repo_accessible(base: str, owner: str, repo: str, token: Optional[str]) -> bool:
+def _forgejo_repo_accessible(server: ForgejoServer, base: str, owner: str, repo: str,
+                             token: Optional[str]) -> bool:
     """`_repo_accessible` for a declared Forgejo, through one of its names. Forgejo, like GitHub,
     answers 404 for a private repository the caller cannot see. Same fallbacks, same reasons."""
     q = urllib.parse.quote
@@ -489,7 +530,7 @@ def _forgejo_repo_accessible(base: str, owner: str, repo: str, token: Optional[s
     if token:
         req.add_header("Authorization", f"token {token}")
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with _forgejo_open(server, req, 15) as resp:
             return resp.status == 200
     except urllib.error.HTTPError as e:
         return e.code not in (403, 404)
@@ -537,7 +578,7 @@ def _fetch_forgejo(gu: GithubUrl, token: Optional[str], attempts: int,
         if status == -1:
             _forgejo_unreachable.add(base)
             continue
-        if status == 404 and token and not _forgejo_repo_accessible(base, gu.owner, gu.repo, token):
+        if status == 404 and token and not _forgejo_repo_accessible(gu.forge, base, gu.owner, gu.repo, token):
             return (-2, None)
         return (status, text)
     return (-1, None)
