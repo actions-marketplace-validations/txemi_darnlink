@@ -25,7 +25,8 @@ def PYTHONS = ['3.10', '3.11', '3.12', '3.13']
 // same script covers the whole Python matrix.
 def localGates(String py, boolean unix) {
   withEnv(["UV_PYTHON=${py}", "UV_PROJECT_ENVIRONMENT=.venv-${py}"]) {
-    if (unix) { sh 'bash tools/check.sh' } else { bat 'bash tools/check.sh' }
+    // On Windows `bash` is the one Git for Windows ships; it is not on PATH by default.
+    if (unix) { sh 'bash tools/check.sh' } else { bat '"%ProgramFiles%\\Git\\bin\\bash.exe" tools/check.sh' }
   }
 }
 
