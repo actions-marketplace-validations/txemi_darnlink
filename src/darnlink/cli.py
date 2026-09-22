@@ -15,7 +15,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Sequence
 
 from .frontmatter_index import DEFAULT_EXCLUDES, build_index, index_from_contents, scan_tree
 from .paths import resolve_cache, resolved
@@ -407,6 +407,14 @@ def _run_web_check_cli(argv: List[str], fetcher=None) -> int:
                              "fenced block. OFF BY DEFAULT: a fleet of fail-closed gates must opt in "
                              "one repository at a time. These links are report-only — they are never "
                              "anchored, because a diagram would render the anchor comment as a node")
+    parser.add_argument("--forgejo", action="append", default=[], metavar="URL[,URL...]",
+                        help="(feature 018) a self-hosted Forgejo instance whose file links "
+                             "(/<owner>/<repo>/src/branch/<ref>/<path>) are verified like GitHub's "
+                             "(repeatable: one flag per instance). Give each name the instance "
+                             "answers to, comma-separated, with scheme and port, e.g. "
+                             "https://forge.example.test,http://forge.lan.example.test:3000 — links "
+                             "are recognised under any of them and fetched through the first one "
+                             "that is reachable. Token: $FORGEJO_TOKEN (never $GITHUB_TOKEN)")
     parser.add_argument("--own-max", type=int, default=None, metavar="N",
                         help="budget: while there are N or fewer owned-without-uuid findings they are "
                              "reported but do not fail the exit. Lets the axis be adopted before a "
@@ -426,6 +434,15 @@ def _run_web_check_cli(argv: List[str], fetcher=None) -> int:
     if (args.own or args.own_from_origin or args.own_max is not None) and not args.online:
         print("error: --own/--own-from-origin/--own-max require --online (ownership is decided on a "
               "fetched destination)", file=sys.stderr)
+        return 1
+    if args.forgejo and not args.online:
+        print("error: --forgejo requires --online (it only changes what is fetched)", file=sys.stderr)
+        return 1
+    from .weblinks import parse_forgejo_servers
+    try:
+        forgejo = parse_forgejo_servers(args.forgejo)
+    except ValueError as e:
+        print(f"error: --forgejo: {e}", file=sys.stderr)
         return 1
     if args.own_max is not None and args.own_max < 0:
         print("error: --own-max must be >= 0; a negative budget cannot be met and its messages would "
@@ -498,11 +515,12 @@ def _run_web_check_cli(argv: List[str], fetcher=None) -> int:
         return 0
 
     token = os.environ.get("GITHUB_TOKEN") or None
+    forgejo_token = (os.environ.get("FORGEJO_TOKEN") or None) if forgejo else None
     web_out_of_root: List[Path] = []
     # This is what lets us tell "pending on the default branch" from "broken" WITHOUT opening the
     # door to downgrading someone else's real break: only the repo we are actually in can have its
     # own working tree consulted about where a `blob/<default-branch>/...` URL points after a merge.
-    own = _own_repo(root, getattr(args, "default_branch", None))
+    own = _own_repo(root, getattr(args, "default_branch", None), forgejo)
     # ⚠️ A RUNG THAT DISABLES ITSELF IN SILENCE IS INDISTINGUISHABLE FROM ONE THAT WORKS, and it
     # took THREE red builds to find that out: the rung was inert in CI and all anyone could see was
     # the same `not-found` as always -- exactly what you would see if it had never been written.
@@ -516,7 +534,8 @@ def _run_web_check_cli(argv: List[str], fetcher=None) -> int:
               "exists here will be reported as broken.", file=sys.stderr)
     findings, edits = check_web_links_online(root, token, fetcher or default_fetcher, block_markers,
                                              excludes, owners, out_of_root=web_out_of_root,
-                                             include_mermaid=args.include_mermaid, own=own)
+                                             include_mermaid=args.include_mermaid, own=own,
+                                             forgejo=forgejo, forgejo_token=forgejo_token)
     ok = [x for x in findings if x.kind == "web_ok"]
     anchors = [x for x in findings if x.kind == "web_anchor"]
     mismatch = [x for x in findings if x.kind == "web_mismatch"]
@@ -602,11 +621,16 @@ def _run_web_check_cli(argv: List[str], fetcher=None) -> int:
             # has seven causes and credentials fix two; suggesting it over a non-GitHub URL or a
             # destination with no uuid is advice that cannot be taken, and advice that cannot be taken
             # is how this line becomes the next thing everyone scrolls past.
-            fixable = sum(1 for x in unverifiable if x.token_would_help)
+            fixable: Dict[str, int] = {}
+            for x in unverifiable:
+                if x.token_would_help:
+                    fixable[x.token_var] = fixable.get(x.token_var, 0) + 1
             read_note = f"clean of what could be READ — {len(unverifiable)} unverifiable, NOT verified"
             outcome = f"{outcome}; {read_note}" if own_no_uuid else read_note
-            if fixable:
-                outcome += f"; {fixable} of them would resolve with GITHUB_TOKEN — export it"
+            # One clause per variable, GitHub's first: a run with no Forgejo declared prints exactly
+            # what it printed before this feature.
+            for var in sorted(fixable, key=lambda v: (v != "GITHUB_TOKEN", v)):
+                outcome += f"; {fixable[var]} of them would resolve with {var} — export it"
         print(f"  -> exit {code} ({outcome})")
         if args.own_max is not None:
             # Four branches (FR-013). An earlier version had two; the third it then grew told you to
@@ -662,7 +686,8 @@ def _github_owner_from_origin(root: Path) -> Optional[str]:
     return m["owner"] if m else None
 
 
-def _own_repo(root: Path, default_branch: Optional[str] = None) -> Optional["OwnRepo"]:
+def _own_repo(root: Path, default_branch: Optional[str] = None,
+              forgejo: Sequence = ()) -> Optional["OwnRepo"]:
     """The repo we are running in: `owner/repo`, its REAL ROOT and its default branch. Or None.
 
     All three from the same reading of git, deliberately. Measured in adversarial review: the gate
@@ -675,11 +700,17 @@ def _own_repo(root: Path, default_branch: Optional[str] = None) -> Optional["Own
     and would answer about ANOTHER repository, silently and with a plausible answer) and an
     ASCII-anchored regex (without `re.ASCII`, IGNORECASE folds U+0131 so a lookalike host resolves
     as GitHub). Any failure returns None and the rung is INERT, which is the safe side.
+
+    With declared Forgejo servers (feature 018), EVERY remote is read, not only `origin`: a repo
+    migrating between forges typically keeps `origin` on one and adds the other under a new name,
+    and its links to the new forge are exactly the ones that are pending until merge. A remote
+    counts only if its host is one of a declared server's names. `origin` may then be a Forgejo
+    remote, in which case `slug` is empty and only `forgejo_slugs` identifies the repo.
     """
     import os as _os
     import re as _re
     import subprocess
-    from darnlink.weblinks import OwnRepo
+    from darnlink.weblinks import OwnRepo, forgejo_identity_of_remote
     env = {k: v for k, v in _os.environ.items()
            if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR")}
 
@@ -697,7 +728,14 @@ def _own_repo(root: Path, default_branch: Optional[str] = None) -> Optional["Own
     m = _re.match(r"(?:(?:https?|ssh)://(?:[^/@]*@)?(?:www\.|ssh\.)?github\.com(?::\d+)?/"
                   r"|(?:[^/@]*@)?github\.com:)(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$",
                   url, _re.IGNORECASE | _re.ASCII)
-    if not m:
+    forgejo_slugs: set = set()
+    if forgejo:
+        for line in (_git("config", "--get-regexp", r"^remote\..*\.url$") or "").splitlines():
+            _name, _, remote_url = line.partition(" ")
+            ident = forgejo_identity_of_remote(remote_url, forgejo)
+            if ident:
+                forgejo_slugs.add(ident)
+    if not m and not forgejo_slugs:
         return None
     top = _git("rev-parse", "--show-toplevel")
     if not top:
@@ -732,7 +770,8 @@ def _own_repo(root: Path, default_branch: Optional[str] = None) -> Optional["Own
             if linea.startswith("ref:") and "refs/heads/" in linea:
                 default_ref = linea.split("refs/heads/", 1)[1].split()[0]
                 break
-    return OwnRepo(slug=f"{m['owner']}/{m['repo']}", root=Path(top), default_ref=default_ref)
+    return OwnRepo(slug=f"{m['owner']}/{m['repo']}" if m else "", root=Path(top),
+                   default_ref=default_ref, forgejo_slugs=frozenset(forgejo_slugs))
 
 
 def _make_stdio_encoding_safe() -> None:

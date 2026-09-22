@@ -97,6 +97,14 @@
 #     repository — but ONLY when this run actually passed an own_* flag, because exit 1 is not
 #     exclusively a usage error (uvx and an uncaught exception use it too). Under `fail_closed` it
 #     still fails the gate with 4: in CI an axis that could not run is not a pass.
+#   forgejo_web (needs `web`): a LIST of self-hosted Forgejo instances whose file links
+#     (/<owner>/<repo>/src/branch/<ref>/<path>) are verified exactly like GitHub's. ONE entry per
+#     instance; if it answers to several names, put them all in that entry, comma-separated, with
+#     scheme and port: "https://forge.example.test,http://forge.lan.example.test:3000". Links are
+#     recognised under any of the names and fetched through the first that is reachable from where
+#     the gate runs — so declare every name the repo's links use. Token: $FORGEJO_TOKEN, or the file
+#     in DARNLINK_GATE_FORGEJO_TOKEN_FILE (default ~/.config/forgejo_token_ro). It is never sent to
+#     GitHub, and $GITHUB_TOKEN is never sent to a Forgejo.
 #   web (mode=max only): add a `web-check --online` pass — cross-repo links to OTHER GitHub repos must
 #     resolve to the destination's uuid (read online). ⚠️ PUBLIC targets need a token too — not for
 #     permission but for QUOTA: anonymous API calls are 60/h per public IP. Without one the pass
@@ -235,6 +243,10 @@ case "${WEB,,}" in ""|0|false|no|off) WEB="" ;; *) WEB=1 ;; esac
 # called `origin` stays expressible, the same reason the CLI has a flag instead of `--own auto`.
 mapfile -t OWN_WEB < <(read_cfg own_web "")
 OWN_WEB_N="$(read_cfg_len own_web)"; [[ "$OWN_WEB_N" =~ ^[0-9]+$ ]] || OWN_WEB_N=0
+# FORGEJO_WEB (opt-in, needs `web`): declared self-hosted Forgejo instances, one entry each, names
+# comma-separated inside the entry. Passed through verbatim: web-check validates them and exits 1 on
+# a malformed one, which the config-error branch below reports as configuration.
+mapfile -t FORGEJO_WEB < <(read_cfg forgejo_web "")
 OWN_WEB_FROM_ORIGIN="${DARNLINK_GATE_OWN_WEB_FROM_ORIGIN:-$(read_cfg own_web_from_origin "")}"
 # ⚠️ NORMALISE ON THE LINE AFTER THE ASSIGNMENT. This `case` used to sit thirteen lines below, past
 # two unrelated assignments -- and that is not a style point, it is how the bug below happened: the
@@ -533,6 +545,20 @@ if [ "$SCOPE" != "staged" ]; then
         echo "  without it the number is not comparable between two runs, let alone two repos." >&2
       fi
       WEB_ARGS=()
+      FORGEJO_PASSED=""
+      for fj in "${FORGEJO_WEB[@]}"; do
+        [ -n "$fj" ] && { WEB_ARGS+=(--forgejo "$fj"); FORGEJO_PASSED=1; }
+      done
+      # Same file convention as GITHUB_TOKEN above, under its OWN variable: one forge's credential is
+      # never handed to the other.
+      if [ -n "$FORGEJO_PASSED" ] && [ -z "${FORGEJO_TOKEN:-}" ]; then
+        _ftf="${DARNLINK_GATE_FORGEJO_TOKEN_FILE:-$HOME/.config/forgejo_token_ro}"
+        [ -f "$_ftf" ] && [ -r "$_ftf" ] && { FORGEJO_TOKEN="$(tr -d '\r\n' < "$_ftf")"; export FORGEJO_TOKEN; }
+      fi
+      if [ -n "$FORGEJO_PASSED" ] && [ -z "${FORGEJO_TOKEN:-}" ]; then
+        echo "darnlink-gate: forgejo_web is declared but there is no FORGEJO_TOKEN — links to a" >&2
+        echo "  private Forgejo repo will come back web_unverifiable (COULD NOT LOOK), not verified." >&2
+      fi
       for e in "${EXCLUDES[@]}";      do [ -n "$e" ] && WEB_ARGS+=(--exclude "$e"); done
       for b in "${IGNORE_BLOCKS[@]}"; do [ -n "$b" ] && WEB_ARGS+=(--ignore-block "$b"); done
       OWN_PASSED=""; OWN_WEB_USED=0
@@ -570,10 +596,11 @@ if [ "$SCOPE" != "staged" ]; then
       # pass. It becomes 4 ("could not gate") and is marked final, so the run still fails and the
       # remaining axes still execute. It must NOT go to `bail()`, which exits the script and would skip
       # them, the bug this pass was fixed for once already.
-      if [ "$rc" -eq 1 ] && [ -n "$OWN_PASSED" ]; then
+      if [ "$rc" -eq 1 ] && { [ -n "$OWN_PASSED" ] || [ -n "$FORGEJO_PASSED" ]; }; then
         echo "darnlink-gate: web-check rejected its own arguments (exit 1) — most likely a CONFIG" >&2
         echo "  error rather than a finding about this repository. Check own_web /" >&2
-        echo "  own_web_from_origin / own_web_max in darnlink-gate.json. The web axis did NOT run." >&2
+        echo "  own_web_from_origin / own_web_max / forgejo_web in darnlink-gate.json. The web axis" >&2
+        echo "  did NOT run." >&2
         if [ -n "$FAIL_CLOSED" ]; then
           echo "  fail_closed is on: an axis that could not run is not a pass. -> 4" >&2
           rc=4

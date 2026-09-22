@@ -71,6 +71,9 @@ $web = -not ([string]::IsNullOrWhiteSpace([string]$rawWeb) -or
 # a one-element array, so `["" ]` is $false to CfgOr and would come back as "absent" — losing the very
 # entry the empty-entry warning exists to name.
 $ownWeb = @(if ($cfg -and $cfg.PSObject.Properties.Name -contains 'own_web') { $cfg.own_web } else { @() })
+# FORGEJO_WEB (opt-in, needs `web`): declared self-hosted Forgejo instances, one entry each, names
+# comma-separated inside the entry - see the bash recipe. Read by presence, like own_web.
+$forgejoWeb = @(if ($cfg -and $cfg.PSObject.Properties.Name -contains 'forgejo_web') { $cfg.forgejo_web } else { @() })
 $rawOWFO = if ($null -ne $env:DARNLINK_GATE_OWN_WEB_FROM_ORIGIN) { $env:DARNLINK_GATE_OWN_WEB_FROM_ORIGIN } else { CfgOr 'own_web_from_origin' '' }
 $ownWebFromOrigin = -not ([string]::IsNullOrWhiteSpace([string]$rawOWFO) -or
                           ([string]$rawOWFO).Trim().ToLower() -in @('0','false','no','off'))
@@ -181,6 +184,20 @@ if ($scope -ne 'staged') {
       $webArgs = @()
       foreach ($e in $excludes)     { if ($e) { $webArgs += @('--exclude', $e) } }
       foreach ($b in $ignoreBlocks) { if ($b) { $webArgs += @('--ignore-block', $b) } }
+      $forgejoPassed = $false
+      foreach ($fj in $forgejoWeb) { if ($fj) { $webArgs += @('--forgejo', $fj); $forgejoPassed = $true } }
+      # Same file convention as GITHUB_TOKEN, under its OWN variable: one forge's credential is never
+      # handed to the other.
+      if ($forgejoPassed -and [string]::IsNullOrWhiteSpace($env:FORGEJO_TOKEN)) {
+        $ftf = if ($env:DARNLINK_GATE_FORGEJO_TOKEN_FILE) { $env:DARNLINK_GATE_FORGEJO_TOKEN_FILE } else { Join-Path $env:USERPROFILE ".config/forgejo_token_ro" }
+        if (Test-Path $ftf -PathType Leaf) {
+          try { $env:FORGEJO_TOKEN = (Get-Content $ftf -Raw -ErrorAction Stop).Trim() } catch { }
+        }
+      }
+      if ($forgejoPassed -and [string]::IsNullOrWhiteSpace($env:FORGEJO_TOKEN)) {
+        Write-Warning "darnlink-gate: forgejo_web is declared but there is no FORGEJO_TOKEN - links to a"
+        Write-Warning "  private Forgejo repo will come back web_unverifiable (COULD NOT LOOK), not verified."
+      }
       $ownPassed = $false
       $ownWebUsed = 0
       foreach ($o in $ownWeb) { if ($o) { $webArgs += @('--own', $o); $ownPassed = $true; $ownWebUsed++ } }
@@ -205,10 +222,11 @@ if ($scope -ne 'staged') {
       # Python exception exits 1 too, so an unconditional swallow would turn those green for a repo
       # that never adopted 016 — a worse guarantee than before this key existed. And it respects
       # fail_closed: in CI an axis that could not run is not a pass.
-      if ($webRc -eq 1 -and $ownPassed) {
+      if ($webRc -eq 1 -and ($ownPassed -or $forgejoPassed)) {
         Write-Warning "darnlink-gate: web-check rejected its own arguments (exit 1) - most likely a CONFIG"
         Write-Warning "  error rather than a finding about this repository. Check own_web /"
-        Write-Warning "  own_web_from_origin / own_web_max in darnlink-gate.json. The web axis did NOT run."
+        Write-Warning "  own_web_from_origin / own_web_max / forgejo_web in darnlink-gate.json. The web axis"
+        Write-Warning "  did NOT run."
         if ($failClosed) {
           Write-Warning "  fail_closed is on: an axis that could not run is not a pass. -> 4"
           $webRc = 4
@@ -231,7 +249,7 @@ if ($scope -ne 'staged') {
 # whole-tree reasoning, and per the wall architecture the staged pre-commit stays fast — max is
 # enforced at the whole-repo wall (pre-push / CI). See docs/elevating-your-link-gate.md §7.
 $staged = @(git diff --cached --name-only --diff-filter=ACMR -- '*.md' 2>$null)
-if (-not $staged) { Write-Output "darnlink-gate (staged): no staged .md — nothing to judge."; exit 0 }
+if (-not $staged) { Write-Output "darnlink-gate (staged): no staged .md - nothing to judge."; exit 0 }
 
 $json = (& uvx --from $ref darnlink check . --json @dlArgs 2>$null | Out-String)
 $rc = $LASTEXITCODE

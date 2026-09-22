@@ -28,7 +28,10 @@ that get relocated and refactored over time.
 > `uuid`. The opt-in **`web-check --online`** command (off by default; **give it a `GITHUB_TOKEN`
 > even for public destinations** — not for permission but for quota: anonymous API calls are 60/h
 > per public IP) anchors a plain link and verifies an anchored one, failing on drift. It's
-> **experimental**, and the core stays fully offline unless you invoke it. See
+> **experimental**, and the core stays fully offline unless you invoke it. A **self-hosted
+> Forgejo** is supported too, once you declare it: `--forgejo https://forge.example.test` (or the
+> `forgejo_web` key of the gate recipe) makes its `/<owner>/<repo>/src/branch/<ref>/<path>` links
+> verified the same way, with their own `FORGEJO_TOKEN`. See
 > [Elevating your link gate §8](docs/elevating-your-link-gate.md) <!-- uuid: e95eaed1-9866-4c48-a0d7-99a6382f5bf9 -->.
 
 ## See it heal a link

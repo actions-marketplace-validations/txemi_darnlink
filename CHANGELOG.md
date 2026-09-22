@@ -6,6 +6,40 @@ All notable changes to darnlink are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- `web-check` no longer lets `GITHUB_TOKEN` follow a redirect to another host. urllib copies
+  `Authorization` onto a redirected request whatever its destination; requests to the GitHub API now
+  keep the token only while the redirect stays on the API origin (a renamed repository's same-host
+  301 still works). Same guard the declared-Forgejo path got when it was introduced.
+
+### Web links to a declared self-hosted Forgejo are verified like GitHub's (feature 018)
+
+Until now `web-check` only recognised `github.com` file URLs; a link to a self-hosted Forgejo was
+reported `web_unverifiable` forever, so a repository moving its forge lost the web axis for every
+link it rewrote. Now a repository can **declare** its Forgejo instances and their links are
+verified, anchored and — on the default branch of this very repository — forgiven as pending,
+exactly like GitHub's.
+
+- **Declared, never guessed.** Any server can serve Forgejo's URL shape; without a declaration
+  nothing changes, byte for byte.
+- **One instance, several names.** A server often answers to one name on a laptop and another on
+  a build agent. Each `--forgejo` declares one instance with all its names, comma-separated; a link
+  written with any name is fetched through the first reachable one.
+- **Two tokens, never crossed.** `FORGEJO_TOKEN` goes only to declared Forgejo names, as
+  `Authorization: token …`; `GITHUB_TOKEN` only to GitHub. The "export …" hint names the variable
+  that would actually help.
+- **`tag/` and `commit/` are immutable by construction** (FR-006), since the URL says so.
+- **Own repository through any remote.** The pending-on-default-branch rung recognises this repo on
+  a declared Forgejo through any git remote whose host is one of its names, not only `origin`.
+
+### Added
+
+- `web-check --forgejo URL[,URL...]` (repeatable) and `$FORGEJO_TOKEN`.
+- Gate recipes: `forgejo_web` key, `DARNLINK_GATE_FORGEJO_TOKEN_FILE`.
+- `darnlink.weblinks.ForgejoServer`, `parse_forgejo_servers()`, `forgejo_identity_of_remote()`;
+  `parse_github_url()` and `check_web_links_online()` take the declared servers.
+
 ### Path resolution is memoised inside an explicit run scope (~-18%)
 
 `Path.resolve()` was called on the same paths over and over: on a ~3,900-file documentation tree one
